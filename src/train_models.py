@@ -1,18 +1,27 @@
 """
 Step 2: Hyperparameter Tuning via Optuna, OOF Meta-Feature Stacking, and Model Export.
 Run: python train_models.py
-Produces: rf_model.pkl, xgb_model.pkl, lgb_model.pkl, meta_model.pkl
+Produces: rf_model.pkl, xgb_model.pkl, lgb_model.pkl, meta_model.pkl, eval_metrics.pkl
 """
+import json
 import joblib
 import numpy as np
 import pandas as pd
+import optuna
+
 from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    confusion_matrix
+)
 import xgboost as xgb
 import lightgbm as lgb
-import optuna
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -96,7 +105,7 @@ def main():
     print("Loading preprocessed dataset...")
     X_train, X_test, y_train, y_test = load_data()
 
-    print("\n--- Phase 1: Bayesian Hyperparameter Optimization ---")[cite: 1]
+    print("\n--- Phase 1: Bayesian Hyperparameter Optimization ---")
     print("Tuning Random Forest...")
     rf_params = tune_random_forest(X_train, y_train)
     print("Tuning XGBoost...")
@@ -104,7 +113,7 @@ def main():
     print("Tuning LightGBM...")
     lgb_params = tune_lightgbm(X_train, y_train)
 
-    print("\n--- Phase 2: Out-of-Fold (OOF) Prediction Generation ---")[cite: 1]
+    print("\n--- Phase 2: Out-of-Fold (OOF) Prediction Generation ---")
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     oof_rf = np.zeros(len(X_train))
     oof_xgb = np.zeros(len(X_train))
@@ -125,7 +134,7 @@ def main():
     # Meta-features matrix
     X_meta_train = np.column_stack((oof_rf, oof_xgb, oof_lgb))
 
-    print("\n--- Phase 3: Meta-Classifier Training ---")[cite: 1]
+    print("\n--- Phase 3: Meta-Classifier & Full Base Learner Training ---")
     meta_model = LogisticRegression()
     meta_model.fit(X_meta_train, y_train)
 
@@ -142,21 +151,51 @@ def main():
 
     final_preds = meta_model.predict(X_meta_test)
     final_probs = meta_model.predict_proba(X_meta_test)[:, 1]
+    
+    tn, fp, fn, tp = confusion_matrix(y_test, final_preds).ravel()
+    specificity = tn / (tn + fp)
 
-    print("\n================ TEST METRICS ================")[cite: 1]
-    print(f"Accuracy:    {accuracy_score(y_test, final_preds):.4f}")
-    print(f"Precision:   {precision_score(y_test, final_preds):.4f}")
-    print(f"Recall:      {recall_score(y_test, final_preds):.4f}")
-    print(f"F1 Score:    {f1_score(y_test, final_preds):.4f}")
-    print(f"ROC-AUC:     {roc_auc_score(y_test, final_probs):.4f}")
+    acc = float(accuracy_score(y_test, final_preds))
+    prec = float(precision_score(y_test, final_preds))
+    rec = float(recall_score(y_test, final_preds))
+    f1 = float(f1_score(y_test, final_preds))
+    auc = float(roc_auc_score(y_test, final_probs))
+
+    print("\n================ TEST METRICS ================")
+    print(f"Accuracy:    {acc:.4f}")
+    print(f"Precision:   {prec:.4f}")
+    print(f"Recall:      {rec:.4f}")
+    print(f"F1 Score:    {f1:.4f}")
+    print(f"ROC-AUC:     {auc:.4f}")
+    print(f"Specificity: {specificity:.4f}")
     print("==============================================")
 
-    # Export Trained Models
+    # 1. Save dictionary expected by Streamlit App
+    eval_metrics = {
+        "accuracy": acc,
+        "precision": prec,
+        "recall_sensitivity": rec,
+        "f1": f1,
+        "roc_auc": auc,
+        "specificity": float(specificity)
+    }
+    joblib.dump(eval_metrics, "eval_metrics.pkl")
+    joblib.dump(eval_metrics, "metrics.pkl")
+
+    # 2. Save JSON & CSV outputs
+    json_metrics = {**eval_metrics, "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+    with open("metrics.json", "w") as f:
+        json.dump(json_metrics, f, indent=4)
+
+    pd.DataFrame({"actual": y_test, "probability": final_probs}).to_csv("test_predictions.csv", index=False)
+
+    # 3. Export Models for Streamlit Inference Workspace
     joblib.dump(rf_full, "rf_model.pkl")
     joblib.dump(xgb_full, "xgb_model.pkl")
     joblib.dump(lgb_full, "lgb_model.pkl")
     joblib.dump(meta_model, "meta_model.pkl")
-    print("\nSaved models: rf_model.pkl, xgb_model.pkl, lgb_model.pkl, meta_model.pkl")
+
+    print("Saved all model binaries and evaluation metrics successfully.")
 
 if __name__ == "__main__":
     main()

@@ -74,7 +74,9 @@ def main():
     df = clean_target(df)
     df = impute_missing(df)
     df = encode_features(df)
-
+    # Save merged dataset for dashboard analysis
+    df.to_csv("merged_heart_dataset.csv", index=False)
+    print("Saved merged_heart_dataset.csv")
     X = df.drop(columns=["target"])
     y = df["target"]
 
