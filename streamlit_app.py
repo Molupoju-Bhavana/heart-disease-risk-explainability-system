@@ -1,647 +1,627 @@
-"""
-CardiAI Decision Support Workspace
-Clinical AI Diagnostic, Stacking Ensemble & Multi-XAI (SHAP & LIME) Engine
-"""
-
-import os
-import joblib
-import numpy as np
-import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
-import matplotlib.pyplot as plt
-import seaborn as sns
+import pandas as pd
+import numpy as np
+import joblib
+import json
+import io
+import os
 import shap
-from lime.lime_tabular import LimeTabularExplainer
+import matplotlib.pyplot as plt
+from lime import lime_tabular
 
-plt.style.use('default')
-plt.rcParams['font.sans-serif'] = 'Helvetica, Arial, DejaVu Sans'
-
-# ==========================================
-# 1. PAGE CONFIG & CLINICAL STYLING
-# ==========================================
 st.set_page_config(
-    page_title="CardiAI Clinical Decision Support System",
-    page_icon="🩺",
+    page_title="Heart Disease Risk Prediction",
+    page_icon="🫀",
     layout="wide"
 )
 
-st.markdown("""
-<style>
-    .main .block-container {
-        max-width: 1100px;
-        padding-top: 1.5rem;
-        padding-bottom: 3rem;
-        margin: auto;
-    }
-    .clinical-card {
-        background-color: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 10px;
-        padding: 22px;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.04), 0 2px 4px -1px rgba(0, 0, 0, 0.02);
-    }
-    .metric-card {
-        background-color: #ffffff;
-        border-radius: 10px;
-        padding: 24px;
-        border: 1px solid #e2e8f0;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.04);
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    .summary-tile {
-        background-color: #f8fafc;
-        border: 1px solid #e2e8f0;
-        border-radius: 8px;
-        padding: 14px;
-        text-align: center;
-    }
-    .summary-tile-label {
-        font-size: 0.78rem;
-        font-weight: 700;
-        color: #64748b;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        margin-bottom: 4px;
-    }
-    .summary-tile-value {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #0f172a;
-    }
-    .badge-low {
-        background-color: #d1fae5; color: #065f46;
-        padding: 6px 16px; border-radius: 20px;
-        font-weight: 700; font-size: 0.95rem; display: inline-block;
-    }
-    .badge-medium {
-        background-color: #fef3c7; color: #92400e;
-        padding: 6px 16px; border-radius: 20px;
-        font-weight: 700; font-size: 0.95rem; display: inline-block;
-    }
-    .badge-high {
-        background-color: #fee2e2; color: #991b1b;
-        padding: 6px 16px; border-radius: 20px;
-        font-weight: 700; font-size: 0.95rem; display: inline-block;
-    }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] {
-        height: 44px; border-radius: 6px; padding: 0 20px;
-        background-color: #f8fafc; font-weight: 600;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #0f172a !important; color: white !important;
-    }
-</style>
-""", unsafe_allow_html=True)
-
 CONTINUOUS_COLS = ["age", "trestbps", "chol", "thalach", "oldpeak"]
 
-FEATURE_MAP = {
-    'age': 'Age', 'sex': 'Biological Sex', 'trestbps': 'Resting Blood Pressure',
-    'chol': 'Serum Cholesterol', 'fbs': 'Fasting Blood Sugar', 'thalach': 'Maximum Heart Rate',
-    'exang': 'Exercise-Induced Angina', 'oldpeak': 'ST Depression (Oldpeak)', 'ca': 'Major Vessels Clearance',
-    'cp_1.0': 'Typical Angina', 'cp_2.0': 'Atypical Angina',
-    'cp_3.0': 'Non-Anginal Discomfort', 'cp_4.0': 'Asymptomatic Chest Pain'
-}
-
-GLOSSARY_DATABASE = {
-    'ST Depression (Oldpeak)': "Measures abnormal electrocardiogram (ECG) shifts induced by exercise stress relative to rest, indicating myocardial ischemia.",
-    'Major Vessels Clearance': "Refers to the count of major coronary arteries (0-3) remaining clear as observed during fluoroscopy imaging.",
-    'Serum Cholesterol': "Total lipid density in the bloodstream; high levels contribute to plaque buildup and arterial narrowing.",
-    'Resting Blood Pressure': "Arterial pressure during resting phase; chronically elevated levels increase arterial stress.",
-    'Maximum Heart Rate': "Peak cardiac rate reached during exercise stress testing; strong heart response generally reflects higher cardiac reserve.",
-    'Exercise-Induced Angina': "Chest distress or tightness brought on by physical exercise due to restricted cardiac blood supply.",
-    'Age': "Patient chronological age; baseline risk naturally increases with advanced age.",
-    'Biological Sex': "Biological parameter impacting baseline cardiovascular epidemiological risk profiles.",
-    'Fasting Blood Sugar': "Indicates blood glucose levels after fasting; elevated levels increase vascular risk.",
-    'Typical Angina': "Classic chest pain presentation caused by reduced blood flow to the cardiac tissue.",
-    'Atypical Angina': "Non-standard chest discomfort presentation that requires differential clinical evaluation.",
-    'Non-Anginal Discomfort': "Chest discomfort non-attributable to ischemic heart conditions.",
-    'Asymptomatic Chest Pain': "Absence of physical chest pain despite potential underlying coronary anomalies."
-}
-
+# ---------------------------------------------------------
+# CACHED MODEL & ARTIFACT LOADING
+# ---------------------------------------------------------
 @st.cache_resource
-def load_ml_pipeline():
-    scaler = joblib.load("scaler.pkl") if os.path.exists("scaler.pkl") else None
-    columns = joblib.load("columns.pkl") if os.path.exists("columns.pkl") else None
-    rf_model = joblib.load("rf_model.pkl") if os.path.exists("rf_model.pkl") else None
-    xgb_model = joblib.load("xgb_model.pkl") if os.path.exists("xgb_model.pkl") else None
-    lgb_model = joblib.load("lgb_model.pkl") if os.path.exists("lgb_model.pkl") else None
-    meta_model = joblib.load("meta_model.pkl") if os.path.exists("meta_model.pkl") else None
-    X_train = pd.read_csv("X_train.csv") if os.path.exists("X_train.csv") else None
+def load_all_artifacts():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
 
+    def get_path(filename):
+        path = os.path.join(base_dir, filename)
+        return path if os.path.exists(path) else filename
+
+    scaler = joblib.load(get_path("scaler.pkl"))
+    expected_cols = joblib.load(get_path("columns.pkl"))       # includes engineered cols
+    rf_model = joblib.load(get_path("rf_model.pkl"))
+    xgb_model = joblib.load(get_path("xgb_model.pkl"))
+    lgb_model = joblib.load(get_path("lgb_model.pkl"))
+    meta_model = joblib.load(get_path("meta_model.pkl"))
+
+    metrics = {}
+    metrics_path = get_path("metrics.json")
+    if os.path.exists(metrics_path):
+        with open(metrics_path, "r") as f:
+            metrics = json.load(f)
+
+    # X_train.csv on disk is BASE columns only (pre-feature-engineering) -
+    # force numeric dtype (get_dummies can produce bool columns, which
+    # breaks XGBoost's inplace_predict when SHAP/LIME feed it raw arrays).
+    X_train = None
+    base_cols = None
     X_train_raw = None
-    if X_train is not None:
+    xtrain_path = get_path("X_train.csv")
+    if os.path.exists(xtrain_path):
+        X_train = pd.read_csv(xtrain_path).astype(float)
+        base_cols = list(X_train.columns)
         X_train_raw = X_train.copy()
-        if scaler is not None:
-            try:
-                valid_cols = [c for c in CONTINUOUS_COLS if c in X_train_raw.columns]
-                if len(valid_cols) == getattr(scaler, "n_features_in_", len(valid_cols)):
-                    X_train_raw[valid_cols] = scaler.inverse_transform(X_train[valid_cols])
-            except ValueError:
-                pass
+        X_train_raw[CONTINUOUS_COLS] = scaler.inverse_transform(X_train[CONTINUOUS_COLS])
 
-    return scaler, columns, rf_model, xgb_model, lgb_model, meta_model, X_train, X_train_raw
+    return scaler, expected_cols, rf_model, xgb_model, lgb_model, meta_model, metrics, X_train_raw, base_cols
+
+
+def engineer_features(df):
+    """Mirrors train_models.py's load_and_engineer() EXACTLY - must run
+    AFTER scaling, since that's the order used during training."""
+    df = df.copy()
+    df['rpp'] = df['thalach'] * df['trestbps']
+    df['dts_approx'] = df['thalach'] - (5.0 * df['oldpeak']) - (4.0 * df['exang'])
+    df['vessel_st_burden'] = (df['ca'] + 1.0) * (df['oldpeak'] + 1.0)
+    df['chol_age_ratio'] = df['chol'] / (df['age'] + 1e-5)
+    return df
+
+
+def build_encoded_row(raw_row: dict, target_cols: list) -> pd.DataFrame:
+    """Turns a flat raw-value dict into a one-hot-encoded row matching
+    target_cols exactly. The categorical columns MUST be cast to float
+    before get_dummies - otherwise it names columns 'cp_3' instead of
+    'cp_3.0', silently mismatching the training columns and zeroing those
+    features out on every prediction (reindex fills missing cols with 0
+    with no error raised)."""
+    df = pd.DataFrame([raw_row])
+    cat_cols = ["cp", "restecg", "slope", "thal"]
+    df[cat_cols] = df[cat_cols].astype(float)
+    df_encoded = pd.get_dummies(df, columns=cat_cols, drop_first=False)
+    return df_encoded.reindex(columns=target_cols, fill_value=0).astype(float)
+
+
+try:
+    (scaler, expected_cols, rf_model, xgb_model, lgb_model, meta_model,
+     metrics, X_train_raw, base_cols) = load_all_artifacts()
+    ens_metrics = metrics.get("ensemble", metrics)
+    opt_thresh = ens_metrics.get("optimal_threshold", 0.50)
+except Exception as e:
+    st.error(f"⚠️ Failed to load model artifacts: {e}")
+    st.info("Make sure you have run `python train_models.py` to generate `.pkl` and `.json` files.")
+    st.stop()
+
 
 @st.cache_resource
-def get_shap_explainer(_rf_model):
-    return shap.TreeExplainer(_rf_model)
+def get_shap_explainer(_background_tuple):
+    """Cached SHAP background + predict function for the FULL blended pipeline (encode ->
+    scale -> engineer -> RF/XGB/LGB -> meta blend 0.65/0.35), so SHAP explains the exact
+    same final_score the app displays. The KernelExplainer itself is NOT cached: it keeps
+    mutable state, and a shared one breaks when Streamlit reruns overlap."""
+    def stacked_predict_proba_raw(x_mat):
+        df_t = pd.DataFrame(x_mat, columns=base_cols).astype(float)
+        df_t[CONTINUOUS_COLS] = scaler.transform(df_t[CONTINUOUS_COLS])
+        df_t = engineer_features(df_t)
+        df_t = df_t.reindex(columns=expected_cols, fill_value=0)
+        rf_p = rf_model.predict_proba(df_t)[:, 1]
+        xgb_p = xgb_model.predict_proba(df_t)[:, 1]
+        lgb_p = lgb_model.predict_proba(df_t)[:, 1]
+        meta_in = np.column_stack((rf_p, xgb_p, lgb_p))
+        meta_p = meta_model.predict_proba(meta_in)[:, 1]
+        base_p = (rf_p + xgb_p + lgb_p) / 3.0
+        return 0.65 * meta_p + 0.35 * base_p
 
-def st_shap(plot, height=None):
-    shap_html = f"<head>{shap.getjs()}</head><body>{plot.html()}</body>"
-    components.html(shap_html, height=height)
+    return shap.kmeans(X_train_raw.values, 15), stacked_predict_proba_raw
 
-def reset_form_fields():
-    st.session_state.prediction_computed = False
-    st.session_state.in_age = 20
-    st.session_state.in_sex = "Male"
-    st.session_state.in_trestbps = 80
-    st.session_state.in_chol = 100
-    st.session_state.in_cp = "1: Typical Angina"
-    st.session_state.in_thalach = 60
-    st.session_state.in_exang = "No"
-    st.session_state.in_fbs = "No"
-    st.session_state.in_ca = 0
-    st.session_state.in_oldpeak = 0.0
 
-scaler, columns, rf_model, xgb_model, lgb_model, meta_model, X_train, X_train_raw = load_ml_pipeline()
+if X_train_raw is not None:
+    shap_background, stacked_predict_proba_raw = get_shap_explainer(tuple(base_cols))
+else:
+    shap_background, stacked_predict_proba_raw = None, None
 
-if 'prediction_computed' not in st.session_state:
-    reset_form_fields()
+# ---------------------------------------------------------
+# EXPLANATION HELPERS (SHAP / LIME -> clinical language)
+# ---------------------------------------------------------
+RED, GREEN = "#dc2626", "#059669"
+MIN_SHAP = 0.001   # ignore contributions below 0.1 percentage points
 
-# ==========================================
-# 2. WORKSPACE HEADER
-# ==========================================
-header_col1, header_col2 = st.columns([5, 1.2])
-with header_col1:
-    st.markdown("""
-        <div style="margin-bottom: 10px;">
-            <h2 style="color: #0f172a; font-weight: 800; margin-bottom: 2px;">
-                🩺 CardiAI Clinical Decision Support Workspace
-            </h2>
-            <p style="color: #64748b; font-size: 0.95rem; margin: 0;">
-                Evidence-Based Ensemble Stacking & Multi-XAI (SHAP & LIME) Engine
-            </p>
-        </div>
-    """, unsafe_allow_html=True)
-with header_col2:
-    st.markdown("<div style='margin-top: 15px;'></div>", unsafe_allow_html=True)
-    if st.button("🔄 New Patient", use_container_width=True):
-        reset_form_fields()
-        st.rerun()
+CAT_LABELS = {
+    "cp": {1.0: "Typical angina", 2.0: "Atypical angina", 3.0: "Non-anginal pain", 4.0: "Asymptomatic"},
+    "restecg": {0.0: "Normal", 1.0: "ST-T abnormality", 2.0: "LV hypertrophy"},
+    "slope": {1.0: "Upsloping", 2.0: "Flat", 3.0: "Downsloping"},
+    "thal": {3.0: "Normal", 6.0: "Fixed defect", 7.0: "Reversible defect"},
+}
 
-# --- DEFINING TABS HERE FIXES NameError FOR tab4 ---
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🎯 Patient Diagnostic Workspace",
-    "📈 Model Evaluation",
-    "🩺 AI Clinical Interpretation (SHAP)",
-    "Local Explanations (LIME)"
+# key: (clinical name, plain-language name)
+META = {
+    "age": ("Age", "age"), "sex": ("Sex", "sex"),
+    "trestbps": ("Resting blood pressure", "resting blood pressure"),
+    "chol": ("Serum cholesterol", "cholesterol"),
+    "fbs": ("Fasting blood sugar", "fasting blood sugar"),
+    "thalach": ("Max heart rate", "max heart rate"),
+    "exang": ("Exercise-induced angina", "chest pain on exercise"),
+    "oldpeak": ("ST depression (oldpeak)", "exercise ECG change"),
+    "ca": ("Major vessels (fluoroscopy)", "blood-vessel scan"),
+    "cp": ("Chest pain type", "chest pain type"),
+    "restecg": ("Resting ECG", "resting ECG"),
+    "slope": ("Peak-exercise ST slope", "exercise ECG slope"),
+    "thal": ("Thalassemia (stress test)", "blood-flow test"),
+}
+
+
+MEANING = {
+    "age": "Heart risk naturally rises with age.",
+    "sex": "Men and women show different heart-disease patterns.",
+    "trestbps": "Blood pressure at rest. High values make the heart work harder.",
+    "chol": "Blood fat that can build up and narrow the arteries.",
+    "fbs": "Blood sugar after fasting. High levels can damage blood vessels.",
+    "thalach": "Highest heart rate reached in the exercise test. A low peak can mean the heart copes poorly with effort.",
+    "exang": "Chest pain brought on by exercise, a sign the heart may not be getting enough blood.",
+    "oldpeak": "How far the ECG line dips during exercise. Bigger dips suggest the heart is short of blood flow.",
+    "ca": "Number of major heart vessels showing narrowing on the scan.",
+    "cp": "Type of chest pain. Some patterns are more linked to heart disease than others.",
+    "restecg": "The heart's electrical tracing at rest.",
+    "slope": "Shape of the ECG line at peak exercise. Flat or downsloping is more worrying.",
+    "thal": "Stress-test result showing whether part of the heart gets less blood (fixed or reversible defect).",
+}
+
+
+def col_group(col):
+    """'cp_4.0' -> 'cp' (one-hot dummies roll up into their clinical feature)."""
+    head = col.split("_")[0]
+    return head if head in CAT_LABELS else col
+
+
+def fmt_value(k, v):
+    if k in CAT_LABELS:
+        return CAT_LABELS[k].get(float(v), str(v))
+    return {
+        "age": f"{v:.0f} years", "sex": "Male" if v == 1 else "Female", "trestbps": f"{v:.0f} mm Hg",
+        "chol": f"{v:.0f} mg/dl", "fbs": "> 120 mg/dl" if v == 1 else "≤ 120 mg/dl", "thalach": f"{v:.0f} bpm",
+        "exang": "Yes" if v == 1 else "No", "oldpeak": f"{v:.1f} mm", "ca": f"{int(v)} vessel(s)",
+    }[k]
+
+
+def join_and(xs):
+    return xs[0] if len(xs) == 1 else ", ".join(xs[:-1]) + " and " + xs[-1]
+
+
+def shap_table(shap_vals, raw_row):
+    """Sum one-hot dummy SHAP values back into their clinical feature (Shapley values are additive)."""
+    g = {}
+    for c, v in zip(base_cols, shap_vals):
+        g[col_group(c)] = g.get(col_group(c), 0.0) + float(v)
+    rows = [{"key": k, "label": META[k][0], "value": fmt_value(k, raw_row[k]), "score": s} for k, s in g.items()]
+    return pd.DataFrame(rows).sort_values("score", ascending=False, ignore_index=True)
+
+
+def lime_table(lime_map, x_row, raw_row):
+    rows = []
+    for i, w in lime_map:
+        g = col_group(base_cols[i])
+        if g in CAT_LABELS and x_row[i] == 0:      # "patient is NOT category X" dummies are redundant
+            continue
+        rows.append({"key": g, "label": META[g][0], "value": fmt_value(g, raw_row[g]), "score": float(w)})
+    return pd.DataFrame(rows, columns=["key", "label", "value", "score"])
+
+
+def top_n(df, n):
+    return df.loc[df.score.abs().nlargest(n).index]
+
+
+def show_fig(fig, width=620):
+    """Fixed-size PNG so charts never balloon to full page width."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    st.image(buf, width=width)
+
+
+def _clean(ax, xlabel):
+    ax.axvline(0, color="#334155", lw=1)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.grid(axis="x", alpha=0.25)
+    ax.set_axisbelow(True)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.tick_params(axis="y", length=0, labelsize=10)
+
+
+def shap_chart(sdf):
+    d = top_n(sdf, 8).query("abs(score) >= @MIN_SHAP").sort_values("score")
+    v = d.score.values * 100
+    lim = max(np.abs(v).max() * 1.3, 1.0)
+    fig, ax = plt.subplots(figsize=(6.5, 0.42 * len(d) + 1.1))
+    ax.barh([f"{l}: {x}" for l, x in zip(d.label, d.value)], v, color=[RED if x > 0 else GREEN for x in v], height=0.62)
+    ax.set_xlim(-lim, lim)
+    for i, x in enumerate(v):
+        ax.text(x + np.sign(x) * lim * 0.02, i, f"{x:+.1f}", va="center", ha="left" if x > 0 else "right",
+                fontsize=9, fontweight="bold", color=RED if x > 0 else GREEN)
+    _clean(ax, "◀ Lowers risk      Raises risk ▶   (percentage points)")
+    return fig
+
+
+def lime_chart(ldf):
+    d = top_n(ldf, 8).sort_values("score")
+    v = d.score.values / np.abs(d.score.values).max() * 100     # relative: strongest = 100
+    c = [RED if x > 0 else GREEN for x in v]
+    fig, ax = plt.subplots(figsize=(6.5, 0.42 * len(d) + 1.1))
+    ax.hlines(range(len(d)), 0, v, color=c, lw=3, alpha=0.7)
+    ax.scatter(v, range(len(d)), s=110, color=c, zorder=3)
+    ax.set_yticks(range(len(d)))
+    ax.set_yticklabels([f"{l}: {x}" for l, x in zip(d.label, d.value)])
+    ax.set_xlim(-135, 135)
+    ax.set_xticks([])
+    _clean(ax, "◀ Decreased risk      Increased risk ▶   (relative influence, strongest = 100)")
+    return fig
+
+
+def get_explanations(raw_row):
+    """SHAP + LIME for the predicted patient, cached so unrelated reruns don't recompute them."""
+    key = tuple(sorted(raw_row.items()))
+    cached = st.session_state.get("expl_cache")
+    if cached and cached["key"] == key:
+        return cached["shap"], cached["lime"], cached["x"], cached["base"]
+
+    x = build_encoded_row(raw_row, base_cols).iloc[0].values
+
+    with st.spinner("Computing SHAP values for the full stacking ensemble..."):
+        np.random.seed(0)
+        explainer = shap.KernelExplainer(stacked_predict_proba_raw, shap_background)   # fresh: not thread-safe to share
+        shap_vals = np.ravel(explainer.shap_values(x.reshape(1, -1), nsamples=120))
+        base_val = float(np.ravel(explainer.expected_value)[0])
+
+    def predict_fn_2class(m):
+        p = stacked_predict_proba_raw(m)
+        return np.column_stack((1 - p, p))
+
+    lime_explainer = lime_tabular.LimeTabularExplainer(
+        training_data=X_train_raw.values, feature_names=base_cols,
+        class_names=["No Disease", "Disease"], mode="classification", random_state=42,
+        categorical_features=[i for i, c in enumerate(base_cols) if c not in CONTINUOUS_COLS],
+    )
+    with st.spinner("Computing LIME explanation for this patient..."):
+        exp = lime_explainer.explain_instance(x, predict_fn_2class, num_features=len(base_cols), num_samples=3000)
+
+    lime_map = exp.as_map()[1]
+    st.session_state["expl_cache"] = {"key": key, "shap": shap_vals, "lime": lime_map, "x": x, "base": base_val}
+    return shap_vals, lime_map, x, base_val
+
+# ---------------------------------------------------------
+# SESSION STATE SETUP FOR NEW PATIENT RESET
+# ---------------------------------------------------------
+defaults = {
+    "age": 52, "sex_choice": "Male", "cp_choice": "Typical Angina", "trestbps": 130, "chol": 240,
+    "fbs_choice": "No", "restecg_choice": "Normal", "thalach": 150, "exang_choice": "Yes",
+    "oldpeak": 1.0, "slope_choice": "Upsloping", "ca": 0, "thal_choice": "Normal",
+}
+
+for key, val in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
+
+def reset_patient_data():
+    for key, val in defaults.items():
+        st.session_state[key] = val
+    st.session_state["has_predicted"] = False
+
+# ---------------------------------------------------------
+# HEADER & NEW PATIENT BUTTON (always visible)
+# ---------------------------------------------------------
+head_col1, head_col2 = st.columns([4, 1])
+
+with head_col1:
+    st.title("🫀 Heart Disease Risk Prediction Engine")
+    st.markdown("Assess patient cardiovascular risk using a **Calibrated Stacking Ensemble**.")
+
+with head_col2:
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.button("➕ New Patient", type="secondary", use_container_width=True, on_click=reset_patient_data)
+
+st.info(f"🎯 **Risk classification cutoff: {opt_thresh:.3f}** — a patient's blended risk score is "
+        f"labeled **High Risk** if it is at or above this value, and **Low Risk** otherwise. "
+        f"This cutoff isn't the default 0.5 — it was chosen by searching thresholds between 0.35 and "
+        f"0.65 for the one that maximizes accuracy on the held-out test set.")
+
+st.divider()
+
+tab_pred, tab_explain, tab_eval = st.tabs([
+    "🩺 Risk Prediction",
+    "💡 SHAP & LIME Explanations",
+    "📊 Model Performance & Metrics"
 ])
 
-# ==========================================
-# TAB 1: DIAGNOSTIC WORKSPACE
-# ==========================================
-with tab1:
-    with st.expander("📝 **Patient Diagnostic Entry Form**", expanded=not st.session_state.prediction_computed):
-        with st.form("clinical_input_form"):
-            st.markdown("##### **1. Primary Vitals & Demographics**")
-            c1, c2, c3, c4 = st.columns(4)
-            age = c1.slider("Age (Years)", 20, 90, key="in_age")
-            sex_lbl = c2.selectbox("Biological Sex", ["Male", "Female"], key="in_sex")
-            trestbps = c3.number_input("Resting BP (mm Hg)", 80, 220, key="in_trestbps")
-            chol = c4.number_input("Cholesterol (mg/dL)", 100, 600, key="in_chol")
+# ---------------------------------------------------------
+# TAB 1: RISK PREDICTION
+# ---------------------------------------------------------
+with tab_pred:
+    st.subheader("Patient Clinical Parameters")
 
-            st.markdown("##### **2. Cardiac Stress & Symptom Profile**")
-            c5, c6, c7, c8 = st.columns(4)
-            cp_lbl = c5.selectbox("Chest Pain Type", ["1: Typical Angina", "2: Atypical Angina", "3: Non-Anginal Pain", "4: Asymptomatic"], key="in_cp")
-            thalach = c6.slider("Max Heart Rate (bpm)", 60, 220, key="in_thalach")
-            exang_lbl = c7.selectbox("Exercise Angina", ["No", "Yes"], key="in_exang")
-            fbs_lbl = c8.selectbox("Fasting Sugar > 120 mg/dL", ["No", "Yes"], key="in_fbs")
+    col1, col2, col3 = st.columns(3)
 
-            st.markdown("##### **3. Diagnostic Electrocardiogram & Fluoroscopy**")
-            c9, c10 = st.columns(2)
-            ca = c9.selectbox("Major Vessels Clearance (0-3 Fluoroscopy)", [0, 1, 2, 3], key="in_ca")
-            oldpeak = c10.slider("ST Depression (Oldpeak)", 0.0, 6.2, step=0.1, key="in_oldpeak")
+    with col1:
+        age = st.number_input("Age", min_value=1, max_value=120, key="age")
+        sex_choice = st.radio("Sex", ["Male", "Female"], horizontal=True, key="sex_choice")
+        cp_choice = st.radio(
+            "Chest Pain Type",
+            ["Typical Angina", "Atypical Angina", "Non-anginal Pain", "Asymptomatic"],
+            key="cp_choice"
+        )
+        trestbps = st.number_input("Resting Blood Pressure [mm Hg]", min_value=50, max_value=250, key="trestbps")
 
-            st.markdown("<br>", unsafe_allow_html=True)
-            submit_btn = st.form_submit_button("🔍 Calculate Risk & Generate Explainability Profile", use_container_width=True)
+    with col2:
+        chol = st.number_input("Serum Cholesterol [mg/dl]", min_value=80, max_value=600, key="chol")
+        fbs_choice = st.radio("Fasting Blood Sugar > 120 mg/dl", ["No", "Yes"], horizontal=True, key="fbs_choice")
+        restecg_choice = st.radio(
+            "Resting ECG Results",
+            ["Normal", "ST-T Abnormality", "LV Hypertrophy"],
+            key="restecg_choice"
+        )
+        thalach = st.number_input("Max Heart Rate Achieved", min_value=50, max_value=230, key="thalach")
 
-    if submit_btn:
-        st.session_state.prediction_computed = True
-        st.session_state.patient_data = {
-            'age': age, 'sex_lbl': sex_lbl, 'trestbps': trestbps, 'chol': chol,
-            'cp_lbl': cp_lbl, 'thalach': thalach, 'exang_lbl': exang_lbl, 'fbs_lbl': fbs_lbl,
-            'ca': ca, 'oldpeak': oldpeak
-        }
+    with col3:
+        exang_choice = st.radio("Exercise Induced Angina", ["No", "Yes"], horizontal=True, key="exang_choice")
+        oldpeak = st.slider("ST Depression (oldpeak)", min_value=0.0, max_value=10.0, step=0.1, key="oldpeak")
+        slope_choice = st.radio(
+            "Slope of Peak Exercise ST",
+            ["Upsloping", "Flat", "Downsloping"],
+            key="slope_choice"
+        )
+        ca = st.slider("Major Vessels (Fluoroscopy)", min_value=0, max_value=3, step=1, key="ca")
+        thal_choice = st.radio(
+            "Thalassemia",
+            ["Normal", "Fixed Defect", "Reversible Defect"],
+            key="thal_choice"
+        )
 
-    if st.session_state.prediction_computed:
-        inputs = st.session_state.patient_data
-        age, sex_lbl, trestbps, chol = inputs['age'], inputs['sex_lbl'], inputs['trestbps'], inputs['chol']
-        cp_lbl, thalach, exang_lbl, fbs_lbl = inputs['cp_lbl'], inputs['thalach'], inputs['exang_lbl'], inputs['fbs_lbl']
-        ca, oldpeak = inputs['ca'], inputs['oldpeak']
+    st.markdown("<br>", unsafe_allow_html=True)
 
-        sex = 1 if sex_lbl == "Male" else 0
-        cp = int(cp_lbl.split(":")[0])
-        fbs = 1 if fbs_lbl == "Yes" else 0
-        exang = 1 if exang_lbl == "Yes" else 0
+    # map plain-language choices back to the numeric codes the model expects
+    sex = 1 if sex_choice == "Male" else 0
+    cp = {"Typical Angina": 1, "Atypical Angina": 2, "Non-anginal Pain": 3, "Asymptomatic": 4}[cp_choice]
+    fbs = 1 if fbs_choice == "Yes" else 0
+    restecg = {"Normal": 0, "ST-T Abnormality": 1, "LV Hypertrophy": 2}[restecg_choice]
+    exang = 1 if exang_choice == "Yes" else 0
+    slope = {"Upsloping": 1, "Flat": 2, "Downsloping": 3}[slope_choice]
+    thal = {"Normal": 3, "Fixed Defect": 6, "Reversible Defect": 7}[thal_choice]
 
-        raw_input_df = pd.DataFrame([{
-            'age': age, 'sex': sex, 'cp': cp, 'trestbps': trestbps, 'chol': chol,
-            'fbs': fbs, 'thalach': thalach, 'exang': exang, 'ca': ca, 'oldpeak': oldpeak
-        }])
-
-        proc_df = pd.DataFrame(0.0, index=[0], columns=columns if columns else [])
-        
-        valid_scale_cols = [c for c in CONTINUOUS_COLS if c in raw_input_df.columns]
-        if scaler and columns and len(valid_scale_cols) == getattr(scaler, "n_features_in_", len(valid_scale_cols)):
-            scaled_vals = scaler.transform(raw_input_df[valid_scale_cols])
-            for idx, col in enumerate(valid_scale_cols):
-                if col in proc_df.columns:
-                    proc_df[col] = scaled_vals[0][idx]
-        else:
-            for col in valid_scale_cols:
-                if col in proc_df.columns:
-                    proc_df[col] = raw_input_df[col].values[0]
-
-        for col_name in ['sex', 'fbs', 'exang', 'ca']:
-            if col_name in proc_df.columns:
-                proc_df[col_name] = float(raw_input_df[col_name].values[0])
-
-        col_key = f"cp_{float(cp)}"
-        if col_key in proc_df.columns:
-            proc_df[col_key] = 1.0
-
-        proc_df_raw = proc_df.copy()
-        for col in valid_scale_cols:
-            if col in proc_df_raw.columns:
-                proc_df_raw[col] = raw_input_df[col].values[0]
-
-        st.session_state.proc_df = proc_df
-        st.session_state.proc_df_raw = proc_df_raw
-
-        if rf_model and xgb_model and lgb_model and meta_model:
-            rf_p = float(rf_model.predict_proba(proc_df)[:, 1][0])
-            xgb_p = float(xgb_model.predict_proba(proc_df)[:, 1][0])
-            lgb_p = float(lgb_model.predict_proba(proc_df)[:, 1][0])
-            meta_in = np.column_stack(([rf_p], [xgb_p], [lgb_p]))
-            risk_probability = float(meta_model.predict_proba(meta_in)[0][1])
-            st.session_state.base_preds = {'Random Forest': rf_p, 'XGBoost': xgb_p, 'LightGBM': lgb_p}
-        else:
-            risk_probability = 0.742
-            st.session_state.base_preds = {'Random Forest': 0.72, 'XGBoost': 0.76, 'LightGBM': 0.71}
-
-        risk_percent = risk_probability * 100.0
-        st.session_state.risk_percent = risk_percent
-
-        if risk_percent < 35.0:
-            diagnosis_str, diagnosis_color, risk_category, badge_style = \
-                "Low Cardiovascular Risk Detected", "#059669", "Low Risk Tier", "badge-low"
-        elif 35.0 <= risk_percent < 65.0:
-            diagnosis_str, diagnosis_color, risk_category, badge_style = \
-                "Moderate Risk Profile Detected", "#d97706", "Medium Risk Tier", "badge-medium"
-        else:
-            diagnosis_str, diagnosis_color, risk_category, badge_style = \
-                "Heart Disease Risk Flagged", "#dc2626", "High Risk Tier", "badge-high"
-
-        st.session_state.risk_category_str = risk_category
-
-        st.markdown("<h4 style='color: #0f172a; margin-top: 10px; margin-bottom: 12px;'>Diagnostic Outcome & Risk Tier</h4>", unsafe_allow_html=True)
-
-        st.markdown(f"""
-            <div class="metric-card">
-                <p style="color: #64748b; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700; margin-bottom: 6px;">
-                    Ensemble Stacking Output
-                </p>
-                <h3 style="color: {diagnosis_color}; font-size: 1.8rem; font-weight: 800; margin-bottom: 12px;">
-                    {diagnosis_str}
-                </h3>
-                <span class="{badge_style}">{risk_category.upper()}</span>
-                <h1 style="font-size: 3.2rem; font-weight: 800; margin-top: 12px; margin-bottom: 0; color: #0f172a;">
-                    {risk_percent:.1f}%
-                </h1>
-                <p style="color: #64748b; font-size: 0.85rem; margin-top: 2px;">Calculated Probability of Coronary Artery Disease</p>
-            </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.info("👆 Complete the patient clinical entry form above and click **Calculate Risk & Generate Explainability Profile**.")
-
-# ==========================================
-# TAB 2: MODEL EVALUATION & BASE LEARNERS
-# ==========================================
-with tab2:
-    st.markdown("### 📈 Stacked Ensemble Model Evaluation & Base Learners")
-    st.markdown("Comprehensive performance diagnostics and base classifier consensus.")
-
-    eval_metrics = joblib.load("eval_metrics.pkl") if os.path.exists("eval_metrics.pkl") else {
-        'accuracy': 0.885, 'precision': 0.875, 'recall_sensitivity': 0.895, 'f1': 0.885, 'roc_auc': 0.942
+    # Raw patient row (base features only, real units) - reused by SHAP/LIME tab
+    raw_row = {
+        "age": age, "sex": sex, "cp": cp, "trestbps": trestbps, "chol": chol,
+        "fbs": fbs, "restecg": restecg, "thalach": thalach, "exang": exang,
+        "oldpeak": oldpeak, "slope": slope, "ca": ca, "thal": thal
     }
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Accuracy", f"{eval_metrics['accuracy']*100:.1f}%")
-    m2.metric("Precision", f"{eval_metrics['precision']*100:.1f}%")
-    m3.metric("Recall", f"{eval_metrics['recall_sensitivity']*100:.1f}%")
-    m4.metric("F1 Score", f"{eval_metrics['f1']*100:.1f}%")
-    m5.metric("ROC-AUC", f"{eval_metrics['roc_auc']:.3f}")
+    # FIX: build_encoded_row casts categorical cols to float BEFORE get_dummies,
+    # so dummy names come out as 'cp_3.0' (matching columns.pkl) instead of
+    # 'cp_3' (which would silently zero out cp/restecg/slope/thal on every
+    # single prediction via the reindex(fill_value=0) below).
+    df_encoded = build_encoded_row(raw_row, expected_cols)
+    df_encoded[CONTINUOUS_COLS] = scaler.transform(df_encoded[CONTINUOUS_COLS])
+    df_encoded = engineer_features(df_encoded)
+    df_final = df_encoded.reindex(columns=expected_cols, fill_value=0)
 
-    st.markdown("---")
+    # Predictions
+    p_rf = float(rf_model.predict_proba(df_final)[:, 1][0])
+    p_xgb = float(xgb_model.predict_proba(df_final)[:, 1][0])
+    p_lgb = float(lgb_model.predict_proba(df_final)[:, 1][0])
 
-    st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-    st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 12px;'>Base Learner Consensus & Ensemble Comparison</h4>", unsafe_allow_html=True)
-    
-    if st.session_state.prediction_computed and 'base_preds' in st.session_state:
-        preds_dict = st.session_state.base_preds
-        preds_df = pd.DataFrame({'Classifier': list(preds_dict.keys()), 'Predicted Risk (%)': [v * 100 for v in preds_dict.values()]})
-        
-        fig_p, ax_p = plt.subplots(figsize=(7, 3.5))
-        bars = ax_p.bar(preds_df['Classifier'], preds_df['Predicted Risk (%)'], color=['#3b82f6', '#0284c7', '#0f172a'])
-        ax_p.axhline(y=st.session_state.risk_percent, color='#ef4444', linestyle='--', label=f'Meta-Model Final ({st.session_state.risk_percent:.1f}%)')
-        ax_p.set_ylabel("Disease Probability (%)", fontweight='bold', fontsize=9)
-        ax_p.set_ylim(0, 100)
-        ax_p.legend(loc='lower right', prop={'size': 9})
-        ax_p.spines['top'].set_visible(False)
-        ax_p.spines['right'].set_visible(False)
-        
-        for bar in bars:
-            yval = bar.get_height()
-            ax_p.text(bar.get_x() + bar.get_width()/2.0, yval + 2, f"{yval:.1f}%", ha='center', va='bottom', fontsize=9, fontweight='bold')
-            
-        plt.tight_layout()
-        st.pyplot(fig_p)
-        plt.close(fig_p)
-    else:
-        st.info("Run a prediction in the **Patient Diagnostic Workspace** tab to view live base learner predictions for the patient.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    meta_in = np.array([[p_rf, p_xgb, p_lgb]])
+    meta_p = float(meta_model.predict_proba(meta_in)[0][1])
+    base_p = (p_rf + p_xgb + p_lgb) / 3.0
+    final_score = 0.65 * meta_p + 0.35 * base_p
 
-    col_cm, col_roc = st.columns(2)
-    
-    with col_cm:
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 12px;'>Confusion Matrix</h4>", unsafe_allow_html=True)
-        cm_data = np.array([[42, 6], [5, 47]])
-        fig_cm, ax_cm = plt.subplots(figsize=(4.5, 3.2))
-        sns.heatmap(cm_data, annot=True, fmt='d', cmap='Blues', cbar=False,
-                    xticklabels=['No Disease', 'Disease'],
-                    yticklabels=['No Disease', 'Disease'],
-                    annot_kws={"size": 12, "weight": "bold"}, ax=ax_cm)
-        ax_cm.set_xlabel('Predicted Label', fontweight='bold', fontsize=9)
-        ax_cm.set_ylabel('True Label', fontweight='bold', fontsize=9)
-        plt.tight_layout()
-        st.pyplot(fig_cm)
-        plt.close(fig_cm)
-        st.markdown("</div>", unsafe_allow_html=True)
+    has_disease = final_score >= opt_thresh
 
-    with col_roc:
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 12px;'>ROC Curve</h4>", unsafe_allow_html=True)
-        fpr = np.linspace(0, 1, 100)
-        tpr = np.power(fpr, 0.35)
-        
-        fig_roc, ax_roc = plt.subplots(figsize=(4.5, 3.2))
-        ax_roc.plot(fpr, tpr, color='#0284c7', lw=2.5, label=f'Stacked Model (AUC = {eval_metrics["roc_auc"]:.3f})')
-        ax_roc.plot([0, 1], [0, 1], color='#94a3b8', lw=1.5, linestyle='--', label='Random Chance')
-        ax_roc.set_xlabel('False Positive Rate', fontweight='bold', fontsize=9)
-        ax_roc.set_ylabel('True Positive Rate', fontweight='bold', fontsize=9)
-        ax_roc.legend(loc='lower right', prop={'size': 8})
-        ax_roc.spines['top'].set_visible(False)
-        ax_roc.spines['right'].set_visible(False)
-        plt.tight_layout()
-        st.pyplot(fig_roc)
-        plt.close(fig_roc)
-        st.markdown("</div>", unsafe_allow_html=True)
+    if st.button("Predict Heart Disease Risk", type="primary", use_container_width=True):
+        st.session_state["has_predicted"] = True
+        st.session_state["raw_row"] = raw_row
+        st.session_state["final_score"] = final_score
 
-# ==========================================
-# TAB 3: REDESIGNED CLINICAL SHAP SECTION
-# ==========================================
-with tab3:
-    if st.session_state.prediction_computed and rf_model and columns:
-        proc_df = st.session_state.proc_df
-        proc_df_raw = st.session_state.proc_df_raw
-        explainer = get_shap_explainer(rf_model)
-        shap_vals = explainer(proc_df)
+    if st.session_state.get("has_predicted", False):
+        # recompute display using the LAST predicted patient (raw_row in session_state),
+        # so switching tabs doesn't lose the result
+        saved_score = st.session_state["final_score"]
+        saved_has_disease = saved_score >= opt_thresh
 
-        if len(shap_vals.values.shape) == 3:
-            val_arr = shap_vals.values[0, :, 1]
-            base_val = shap_vals.base_values[0, 1] if np.ndim(shap_vals.base_values) > 1 else shap_vals.base_values[0]
+        st.subheader("Prediction Output")
+        if saved_has_disease:
+            st.error(f"### ⚠️ High Risk of Heart Disease Detected\n"
+                     f"**Predicted Risk Score:** {saved_score * 100:.2f}%  "
+                     f"(cutoff: {opt_thresh:.3f} → {opt_thresh*100:.1f}%)")
         else:
-            val_arr = shap_vals.values[0]
-            base_val = shap_vals.base_values[0]
+            st.success(f"### ✅ Low Risk / Normal Result\n"
+                       f"**Predicted Risk Score:** {saved_score * 100:.2f}%  "
+                       f"(cutoff: {opt_thresh:.3f} → {opt_thresh*100:.1f}%)")
 
-        shap_df = pd.DataFrame({
-            'Feature': [FEATURE_MAP.get(c, c) for c in columns],
-            'RawFeature': columns,
-            'SHAP_Value': val_arr
-        })
+        st.progress(min(max(saved_score, 0.0), 1.0))
+        st.caption(f"A score at or above {opt_thresh*100:.1f}% is classified High Risk; below it, Low Risk.")
 
-        pos_df = shap_df[shap_df['SHAP_Value'] > 0].sort_values(by='SHAP_Value', ascending=False)
-        neg_df = shap_df[shap_df['SHAP_Value'] < 0].sort_values(by='SHAP_Value', ascending=True)
-
-        most_influential = pos_df.iloc[0]['Feature'] if not pos_df.empty else "None"
-        strongest_protective = neg_df.iloc[0]['Feature'] if not neg_df.empty else "None"
-        num_positive = len(pos_df)
-        num_protective = len(neg_df)
-
-        # 1. SHAP FORCE PLOT SECTION
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 4px;'>Why The AI Reached This Decision</h4>", unsafe_allow_html=True)
-        st.markdown("<p style='color: #64748b; font-size: 0.9rem; margin-bottom: 16px;'>Patient-specific directional risk forces pushing probability higher (red) or lower (blue) from baseline.</p>", unsafe_allow_html=True)
-        
-        force_plot = shap.force_plot(
-            base_val, 
-            val_arr, 
-            proc_df_raw.iloc[0].round(1), 
-            feature_names=[FEATURE_MAP.get(c, c) for c in columns],
-            matplotlib=False
-        )
-        st_shap(force_plot, height=140)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # 2. AI-GENERATED CLINICAL INTERPRETATION CARD
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 10px;'>📋 AI-Generated Clinical Interpretation</h4>", unsafe_allow_html=True)
-
-        top_pos_names = pos_df.head(3)['Feature'].tolist()
-        top_neg_names = neg_df.head(2)['Feature'].tolist()
-
-        if top_pos_names:
-            pos_phrase = ", ".join(top_pos_names[:-1]) + f" and {top_pos_names[-1]}" if len(top_pos_names) > 1 else top_pos_names[0]
-            pos_sentence = f"The model identified <b>{pos_phrase}</b> as the primary drivers contributing to the patient's elevated cardiovascular risk profile."
-        else:
-            pos_sentence = "No major clinical indicators were found to actively increase cardiovascular risk."
-
-        if top_neg_names:
-            neg_phrase = ", ".join(top_neg_names[:-1]) + f" and {top_neg_names[-1]}" if len(top_neg_names) > 1 else top_neg_names[0]
-            neg_sentence = f"Favorable defensive influence was demonstrated by <b>{neg_phrase}</b>, which helped reduce the baseline risk trajectory."
-        else:
-            neg_sentence = "Limited protective cardiac factors were present to counterbalance the identified risk contributors."
-
-        patient_risk_cat = st.session_state.get('risk_category_str', 'Assessment Pending')
-
-        narrative_html = f"""
-        <p style="color: #334155; font-size: 0.98rem; line-height: 1.6; margin: 0;">
-            {pos_sentence} These findings closely align with diagnostic patterns typical in individuals presenting with heightened ischemic susceptibility. 
-            {neg_sentence} Considering the combined contribution of all diagnostic indicators, the patient has been classified under the 
-            <strong style="color: #0f172a;">{patient_risk_cat}</strong> (Calculated Probability: <strong>{st.session_state.risk_percent:.1f}%</strong>).
-        </p>
-        """
-        st.markdown(narrative_html, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # 3. EXPLANATION SUMMARY CARD
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 16px;'>📊 Explanation Summary</h4>", unsafe_allow_html=True)
-        
-        sum_c1, sum_c2, sum_c3, sum_c4, sum_c5 = st.columns(5)
-        
-        with sum_c1:
-            st.markdown(f"""
-                <div class="summary-tile">
-                    <div class="summary-tile-label">Most Influential</div>
-                    <div class="summary-tile-value" style="color: #dc2626;">{most_influential}</div>
-                </div>
-            """, unsafe_allow_html=True)
-            
-        with sum_c2:
-            st.markdown(f"""
-                <div class="summary-tile">
-                    <div class="summary-tile-label">Strongest Protective</div>
-                    <div class="summary-tile-value" style="color: #059669;">{strongest_protective}</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        with sum_c3:
-            st.markdown(f"""
-                <div class="summary-tile">
-                    <div class="summary-tile-label">Positive Factors</div>
-                    <div class="summary-tile-value">{num_positive}</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        with sum_c4:
-            st.markdown(f"""
-                <div class="summary-tile">
-                    <div class="summary-tile-label">Protective Factors</div>
-                    <div class="summary-tile-value">{num_protective}</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        with sum_c5:
-            st.markdown(f"""
-                <div class="summary-tile">
-                    <div class="summary-tile-label">Final Risk</div>
-                    <div class="summary-tile-value" style="color: #0f172a;">{st.session_state.risk_percent:.1f}%</div>
-                </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        # 4. CLINICAL TERMS USED IN THIS ASSESSMENT
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h4 style='color: #0f172a; font-weight: 700; margin-bottom: 6px;'>📚 Clinical Terms Used In This Assessment</h4>", unsafe_allow_html=True)
-        st.markdown("<p style='color: #64748b; font-size: 0.88rem; margin-bottom: 14px;'>Definitions corresponding specifically to this patient's top decision-driving clinical parameters.</p>", unsafe_allow_html=True)
-
-        top_influential_features = shap_df.reindex(
-            shap_df['SHAP_Value'].abs().sort_values(ascending=False).index
-        ).head(5)['Feature'].tolist()
-
-        for term in top_influential_features:
-            if term in GLOSSARY_DATABASE:
-                with st.expander(f"🩺 **{term}**"):
-                    st.write(GLOSSARY_DATABASE[term])
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
+# ---------------------------------------------------------
+# TAB 2: SHAP & LIME EXPLANATION
+# ---------------------------------------------------------
+with tab_explain:
+    if not st.session_state.get("has_predicted", False):
+        st.info("👆 Please click 'Predict Heart Disease Risk' in the Risk Prediction tab first to compute feature explanations for the current patient.")
+    elif X_train_raw is None or shap_background is None:
+        st.warning("X_train.csv not found alongside the model artifacts - SHAP/LIME need it as background "
+                   "data. Make sure X_train.csv is in the same folder as the .pkl files.")
     else:
-        st.info(" Run a prediction in the **Patient Diagnostic Workspace** tab to generate SHAP visualizations.")
+        p_row = st.session_state["raw_row"]
+        score = st.session_state["final_score"]
+        high = score >= opt_thresh
+        verdict = "High" if high else "Low"
+        shap_vals, lime_map, x_row, base_val = get_explanations(p_row)
+        sdf, ldf = shap_table(shap_vals, p_row), lime_table(lime_map, x_row, p_row)
+        names = lambda df, n: join_and([f"**{r.label}** ({r.value})" for r in df.head(n).itertuples()])
+        plain = lambda df, n: join_and([f"{META[r.key][1]} ({r.value})" for r in df.head(n).itertuples()])
 
-# ==========================================
-# TAB 4: LIME LOCAL EXPLANATIONS
-# ==========================================
+        st.markdown(f"### {'⚠️ High' if high else '✅ Low'} Risk · score {score:.1%} "
+                    f"<span style='font-size:0.9rem;opacity:.7'>(cutoff {opt_thresh:.1%})</span>", unsafe_allow_html=True)
 
-# ==========================================
-# TAB 4: LIME LOCAL EXPLANATIONS (ENHANCED)
-# ==========================================
-with tab4:
-    st.markdown("### Local Interpretable Model-agnostic Explanations (LIME)")
-    st.markdown("Local surrogate model evaluating immediate feature contributions for this specific patient.")
+        t_shap, t_lime = st.tabs(["📊 SHAP · What drives the score", "🧑‍⚕️ LIME · Why this patient"])
 
-    if st.session_state.prediction_computed and rf_model and columns:
-        # Top Controls: Select Number of Features
-        num_feat = st.slider("Select Number of Top Features to Display:", 3, 10, 6, key="lime_num_feat")
+        # ---------------- SHAP: baseline -> contributions -> final score ----------------
+        with t_shap:
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                show_fig(shap_chart(sdf))
+            with c2:
+                pos = sdf[sdf.score >= MIN_SHAP]
+                neg = sdf[sdf.score <= -MIN_SHAP].sort_values("score")
+                why, against = (pos, neg) if high else (neg, pos)
+                shown = top_n(sdf, 5)
+                other = (score - base_val) - shown.score.sum()     # remainder, so the ledger always adds up
+                ledger = [f"Average patient: **{base_val:.1%}**"]
+                ledger += [f"{'🔺' if r.score > 0 else '🔻'} {r.label} ({r.value}): **{r.score * 100:+.1f}**"
+                           for r in shown.itertuples()]
+                if abs(other) >= MIN_SHAP:
+                    ledger.append(f"▫️ Other findings: **{other * 100:+.1f}**")
+                ledger.append(f"= **Final {score:.1%}**, {'above' if high else 'below'} cutoff {opt_thresh:.1%} → **{verdict} Risk**")
 
-        col_graph, col_text = st.columns([1.2, 1])
+                with st.container(border=True):
+                    st.markdown("**🧾 Why this prediction? (SHAP)**")
+                    st.markdown(f"Predicted **{verdict} Risk** mainly because of {names(why, 3)}." +
+                                (f" {names(against, 2)} pushed the other way, but not enough to change the result."
+                                 if not against.empty else ""))
+                    st.markdown("  \n".join(ledger))
+                    st.caption("Steps are percentage points added to (🔺) or removed from (🔻) the average patient's risk.")
+            with st.expander("ℹ️ What is SHAP?"):
+                st.markdown(
+                    "SHAP splits the risk score into a fair share for each clinical finding, so you can see what the "
+                    "model relied on.\n\n"
+                    "Start from the average patient's risk. Each bar is how many percentage points a finding moved "
+                    "**this** patient **up (red)** or **down (green)**, and the bars add up to the final score. "
+                    "It shows patterns the model learned, not proof of cause.")
 
-        with col_graph:
-            st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-            st.markdown("<h5 style='color: #0f172a; font-weight: 700; margin-bottom: 12px;'>Local Feature Weight Contributions</h5>", unsafe_allow_html=True)
-            
-            try:
-                background_data = X_train.values if X_train is not None else np.zeros((10, len(columns)))
-                clean_feature_names = [FEATURE_MAP.get(c, c) for c in columns]
-                
-                lime_explainer = LimeTabularExplainer(
-                    training_data=background_data,
-                    feature_names=clean_feature_names,
-                    class_names=['Low Risk', 'High Risk'],
-                    mode='classification'
-                )
-                
-                exp = lime_explainer.explain_instance(
-                    data_row=st.session_state.proc_df.iloc[0].values,
-                    predict_fn=rf_model.predict_proba,
-                    num_features=num_feat
-                )
+        # ---------------- LIME: which conditions support Disease vs No Disease ----------------
+        with t_lime:
+            l_inc = ldf[ldf.score > 0].sort_values("score", ascending=False)
+            l_dec = ldf[ldf.score < 0].sort_values("score")
+            l_mx = ldf.score.abs().max()
+            lvl = lambda w: "strong" if abs(w) / l_mx >= 0.66 else "moderate" if abs(w) / l_mx >= 0.33 else "mild"
+            bullets = lambda df, n: "\n".join(f"- {r.label} ({r.value}) · {lvl(r.score)}" for r in df.head(n).itertuples())
+            match = sum(k in set(top_n(ldf, 3).key) for k in top_n(sdf, 3).key)
+            lwhy, lagainst = (l_inc, l_dec) if high else (l_dec, l_inc)
 
-                fig_lime = exp.as_pyplot_figure()
-                fig_lime.set_size_inches(5, 3.2)
-                plt.xticks(fontsize=8)
-                plt.yticks(fontsize=8)
-                plt.tight_layout()
-                st.pyplot(fig_lime)
-                plt.close(fig_lime)
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                show_fig(lime_chart(ldf))
+            with c2:
+                with st.container(border=True):
+                    st.markdown(f"**🩺 Clinical view (LIME)**  \nDisease **{score:.1%}** · No Disease **{1 - score:.1%}**")
+                    if not l_inc.empty:
+                        st.markdown(f"🔺 **Supports Disease**\n{bullets(l_inc, 3)}")
+                    if not l_dec.empty:
+                        st.markdown(f"🔻 **Supports No Disease**\n{bullets(l_dec, 3)}")
+                    st.caption(f"{'✅' if match >= 2 else '⚠️'} {match}/3 top drivers match SHAP")
+                with st.container(border=True):
+                    st.markdown("**💬 In simple words (for the patient)**")
+                    st.markdown(
+                        f"Your score is **{score:.0%}**, {'above' if high else 'below'} the **{opt_thresh:.0%}** alert level, "
+                        f"so it is flagged **{'higher' if high else 'lower'} risk**." +
+                        (f"  \n**Why:** {plain(lwhy, 3)} match patterns the tool has seen in patients "
+                         f"{'with' if high else 'without'} heart disease." if not lwhy.empty else "") +
+                        (f"  \n**Pulling the other way:** {plain(lagainst, 2)}." if not lagainst.empty else "") +
+                        "  \n" + ("This is not a diagnosis. Please discuss it with your doctor." if high
+                                  else "That is reassuring, but keep up regular check-ups."))
+            with st.expander("ℹ️ What is LIME? How is it different from SHAP?"):
+                st.markdown(
+                    "LIME explains **one prediction**: it slightly changes this patient's values many times, watches how "
+                    "the risk score reacts, and reports which conditions support *Disease* or *No Disease* "
+                    "**for this patient**. Strength labels are relative to each other.\n\n"
+                    "**SHAP** gives the overall feature-contribution analysis of the risk score (model transparency). "
+                    "**LIME** gives a local explanation specific to the current patient.")
 
-            except Exception:
-                features = [FEATURE_MAP.get(c, c) for c in columns[:num_feat]]
-                weights = [0.18, 0.12, 0.08, -0.05, -0.10, -0.14][:num_feat]
-                
-                fig_lime_fb, ax_lime = plt.subplots(figsize=(5, 3.2))
-                colors = ['#ef4444' if w > 0 else '#10b981' for w in weights]
-                ax_lime.barh(features, weights, color=colors)
-                ax_lime.axvline(0, color='#94a3b8', linestyle='--', linewidth=1)
-                ax_lime.set_xlabel('Local Weight Contribution', fontweight='bold', fontsize=8)
-                ax_lime.tick_params(axis='both', which='major', labelsize=8)
-                ax_lime.spines['top'].set_visible(False)
-                ax_lime.spines['right'].set_visible(False)
-                plt.tight_layout()
-                st.pyplot(fig_lime_fb)
-                plt.close(fig_lime_fb)
+# ---------------------------------------------------------
+# TAB 3: MODEL EVALUATION
+# ---------------------------------------------------------
+with tab_eval:
+    st.subheader("Model Performance Summary")
 
-            st.markdown("</div>", unsafe_allow_html=True)
+    st.info(f"🎯 **Classification cutoff used for all metrics below: {opt_thresh:.3f}** "
+            f"(chosen to maximize accuracy on the test set; the default 0.5 was not used).")
 
-        with col_text:
-            st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-            st.markdown("<h5 style='color: #0f172a; font-weight: 700; margin-bottom: 10px;'>📋 Clinical Interpretation Guide for Physicians</h5>", unsafe_allow_html=True)
-            
-            st.markdown("""
-            * **Local Linear Surrogate Modeling**: Fits a localized decision boundary around this patient's profile to isolate immediate risk drivers.
-            * **Red Bars (Risk Escalators)**: Parameters locally increasing predicted probability of **High Risk**.
-            * **Green Bars (Risk Attenuators)**: Protective parameters pulling predictions toward **Low Risk**.
-            * **Magnitude Significance**: Relative bar length indicates feature weight strength locally.
-            * **Action Plan**: Focus clinical intervention on top red parameters to optimize risk mitigation.
-            """)
-            st.markdown("</div>", unsafe_allow_html=True)
+    m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
+    m_col1.metric("Ensemble Accuracy", f"{ens_metrics.get('accuracy', 0)*100:.2f}%")
+    m_col2.metric("Precision", f"{ens_metrics.get('precision', 0)*100:.2f}%")
+    m_col3.metric("Recall (Sensitivity)", f"{ens_metrics.get('recall_sensitivity', 0)*100:.2f}%")
+    m_col4.metric("Specificity", f"{ens_metrics.get('specificity', 0)*100:.2f}%")
+    m_col5.metric("F1-Score", f"{ens_metrics.get('f1', 0)*100:.2f}%")
+    m_col6.metric("ROC-AUC", f"{ens_metrics.get('roc_auc', 0):.4f}")
 
-        # NEW ADDITION: Actionable Modifiable Risk Factors Summary
-        st.markdown("<div class='clinical-card'>", unsafe_allow_html=True)
-        st.markdown("<h5 style='color: #0f172a; font-weight: 700; margin-bottom: 8px;'>🎯 Targeted Clinical Intervention Targets</h5>", unsafe_allow_html=True)
-        st.markdown("""
-        * **Primary Target 1**: Focus on resolving **ST Depression** via follow-up cardiac stress testing or angiography.
-        * **Primary Target 2**: Evaluate exercise tolerance and symptom management for **Angina**.
-        * **Protective Reinforcement**: Maintain regular lipid monitoring to keep cholesterol within defensive limits.
-        """)
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.divider()
 
+    if "random_forest" in metrics:
+        st.subheader("📊 Individual Base Learner Metrics")
+
+        b_col1, b_col2, b_col3 = st.columns(3)
+
+        rf_df = pd.DataFrame({
+            "Metric": ["Accuracy", "Precision", "Recall", "F1 Score"],
+            "Score (%)": [metrics["random_forest"]["accuracy"]*100, metrics["random_forest"]["precision"]*100,
+                          metrics["random_forest"]["recall_sensitivity"]*100, metrics["random_forest"]["f1"]*100]
+        }).set_index("Metric")
+
+        xgb_df = pd.DataFrame({
+            "Metric": ["Accuracy", "Precision", "Recall", "F1 Score"],
+            "Score (%)": [metrics["xgboost"]["accuracy"]*100, metrics["xgboost"]["precision"]*100,
+                          metrics["xgboost"]["recall_sensitivity"]*100, metrics["xgboost"]["f1"]*100]
+        }).set_index("Metric")
+
+        lgb_df = pd.DataFrame({
+            "Metric": ["Accuracy", "Precision", "Recall", "F1 Score"],
+            "Score (%)": [metrics["lightgbm"]["accuracy"]*100, metrics["lightgbm"]["precision"]*100,
+                          metrics["lightgbm"]["recall_sensitivity"]*100, metrics["lightgbm"]["f1"]*100]
+        }).set_index("Metric")
+
+        with b_col1:
+            st.markdown("##### 🌲 Random Forest")
+            st.bar_chart(rf_df, height=280, use_container_width=True)
+        with b_col2:
+            st.markdown("##### ⚡ XGBoost")
+            st.bar_chart(xgb_df, height=280, use_container_width=True)
+        with b_col3:
+            st.markdown("##### 🍃 LightGBM")
+            st.bar_chart(lgb_df, height=280, use_container_width=True)
+
+        st.divider()
+        st.subheader("📈 Overall Models Comparison (Base Learners vs Stacking Ensemble)")
+
+        model_names = ["Random Forest", "XGBoost", "LightGBM", "Stacking Ensemble"]
+        model_metrics = [metrics["random_forest"], metrics["xgboost"], metrics["lightgbm"], ens_metrics]
+        metric_keys = ["accuracy", "precision", "recall_sensitivity", "f1"]
+        metric_labels = ["Accuracy", "Precision", "Recall", "F1-Score"]
+
+        data = np.array([[m[k]*100 for k in metric_keys] for m in model_metrics])
+
+        fig3, ax3 = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(model_names))
+        width = 0.2
+        bar_colors = ["#0284c7", "#7c3aed", "#059669", "#d97706"]
+        for i, (mlabel, color) in enumerate(zip(metric_labels, bar_colors)):
+            bars = ax3.bar(x + (i - 1.5) * width, data[:, i], width, label=mlabel, color=color)
+            for b in bars:
+                ax3.text(b.get_x() + b.get_width()/2, b.get_height() + 0.5, f"{b.get_height():.1f}",
+                          ha='center', fontsize=8)
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(model_names)
+        ax3.set_ylabel("Score (%)")
+        ax3.set_ylim(0, 110)
+        ax3.legend(loc="lower right", ncol=4, fontsize=9)
+        ax3.spines['top'].set_visible(False)
+        ax3.spines['right'].set_visible(False)
+        plt.tight_layout()
+        st.pyplot(fig3)
+        plt.close(fig3)
+
+        st.subheader("Detailed Metric Matrix")
+        df_comp = pd.DataFrame({
+            "Model": model_names,
+            "Accuracy (%)": data[:, 0], "Precision (%)": data[:, 1],
+            "Recall (%)": data[:, 2], "F1 Score (%)": data[:, 3]
+        }).set_index("Model")
+        st.dataframe(df_comp.style.format("{:.2f}%"), use_container_width=True)
     else:
-        st.info("Run a prediction in the **Patient Diagnostic Workspace** tab to generate LIME local explanations.")
+        st.info("Run model training separately to view comparison metrics.")
